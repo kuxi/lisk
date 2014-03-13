@@ -27,6 +27,7 @@ class Node(object):
         self.entry.st_ino = inode
         self.type = node_type
         self.doc_id = doc_id
+        self.cached = False
 
 
 class FileNode(Node):

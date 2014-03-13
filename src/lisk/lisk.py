@@ -45,7 +45,7 @@ class Lisk(llfuse.Operations):
         self.nodes = {
             llfuse.ROOT_INODE: self.ROOT_NODE
         }
-        self.inode_number = self.ROOT_NODE.inode + 1
+        self.inode_number = self.ROOT_NODE.inode
 
     def _create_dummy_attr(self, inode):
         entry = llfuse.EntryAttributes()
@@ -91,6 +91,10 @@ class Lisk(llfuse.Operations):
         entry = self.nodes[inode].entry
         return entry
 
+    def getxattr(self, inode, name):
+        print 'entering getxattr', inode, name
+        raise llfuse.FUSEError(llfuse.ENOATTR)
+
     def setattr(self, inode, attr):
         print 'entering setattr', inode, attr
         node = self.nodes[inode]
@@ -111,6 +115,54 @@ class Lisk(llfuse.Operations):
             node.entry.st_rdev = attr.st_rdev
 
         return self.getattr(inode)
+
+    def can_create(self, child_type, parent_type):
+        if child_type == Node.FILE:
+            if parent_type != Node.PROJECT:
+                # TODO: allow moving files to filespaces
+                #Only allow moving files to projects
+                return False
+            return True
+        elif child_type == Node.PROJECT:
+            if parent_type != Node.SPACE:
+                return False
+            return True
+        return False
+
+    def rename(self, parent_old_i, old_name, parent_new_i, new_name):
+        print 'renaming', parent_old_i, old_name, parent_new_i, new_name
+        parent_new = self.nodes[parent_new_i]
+        parent_old = self.nodes[parent_old_i]
+        if self.getattr(parent_new_i).st_nlink == 0:
+            print 'Attempted to create entry %s with unlinked parent %d' % (
+                new_name, parent_new_i)
+            raise llfuse.FUSEError(errno.EINVAL)
+        try:
+            old_node_attr = self.lookup(parent_old_i, old_name)
+        except llfuse.FUSEError:
+            print 'Attempted to move nonexistant file %s', old_name
+            raise
+        old_node = self.nodes[old_node_attr.st_ino]
+        if not self.can_create(old_node.type, parent_new.type):
+            raise llfuse.FUSEError(errno.EINVAL)
+
+        if old_node.type == Node.PROJECT:
+            utils.put_project(old_node.doc_id, {
+                'title': new_name,
+                'space': parent_new.doc_id
+            })
+        elif old_node.type == Node.FILE:
+            parent_type = 'project'
+            if parent_new.type == Node.SPACE:
+                parent_type = 'space'
+            options = {'title': new_name}
+            options[parent_type] = parent_new.doc_id
+            utils.put_file(old_node.doc_id, options)
+
+        old_node.name = new_name
+        old_node.parent = parent_new
+        parent_new.cached = False
+        parent_old.cached = False
 
     def opendir(self, inode):
         print 'opendir', inode
@@ -168,38 +220,45 @@ class Lisk(llfuse.Operations):
 
     def readdir(self, fh, off):
         print 'readdir', fh, off
-        node = self.nodes[fh]
-        if node.type == Node.ROOT:
-            #Working with root, get all spaces
-            transformer = self._make_json_transformer(
-                self.ROOT_NODE, self.DIR_MODE)
-            for i, node in enumerate(utils.get_spaces(
-                                     transformer, offset=off)):
-                self.nodes[node.inode] = node
-                yield (node.name, self.getattr(node.inode), off+i+1)
-        elif node.type == Node.SPACE:
-            #working with a space, get its projects
-            transformer = self._make_json_transformer(
-                node, self.DIR_MODE)
-            for i, node in enumerate(utils.get_space_projects(
-                                     transformer, node.doc_id, offset=off)):
-                self.nodes[node.inode] = node
-                yield (node.name, self.getattr(node.inode), off+i+1)
-        elif node.type == Node.PROJECT:
-            #working with a project, get its files
-            transformer = self._make_json_transformer(
-                node, self.FILE_MODE)
-            for i, node in enumerate(utils.get_project_files(
-                                     transformer, node.doc_id, offset=off)):
-                self.nodes[node.inode] = node
-                yield (node.name, self.getattr(node.inode), off+i+1)
-        else:
+        parent = self.nodes[fh]
+        # TODO: this won't work properly when offset is used
+        #       If I want to cache like this I'll need to get all children of
+        #       the parent before marking it as cached, not from some offset
+        #       and there is no guarantee that this generator will be
+        #       exhausted, meaning the cached flag won't be set
+        if parent.cached:
             children = filter(lambda i: self.nodes[i].parent.inode == fh,
                               self.nodes)
-            for i, f in enumerate(cildren[off:]):
-                print('yielding', self.nodes[f].name,
-                      self.nodes[f].entry, off+i+1)
-                yield (self.nodes[f].name, self.getattr(f), off+i+1)
+            generator = (self.nodes[f] for f in children[off:])
+        else:
+            if parent.type == Node.ROOT:
+                #Working with root, get all spaces
+                transformer = self._make_json_transformer(
+                    self.ROOT_NODE, self.DIR_MODE)
+                generator = utils.get_spaces(transformer, offset=off)
+            elif parent.type == Node.SPACE:
+                #working with a space, get its projects
+                # TODO: handle filespaces
+                transformer = self._make_json_transformer(
+                    parent, self.DIR_MODE)
+                generator = utils.get_space_projects(transformer,
+                                                     parent.doc_id, offset=off)
+            elif parent.type == Node.PROJECT:
+                #working with a project, get its files
+                transformer = self._make_json_transformer(
+                    parent, self.FILE_MODE)
+                generator = utils.get_project_files(transformer, parent.doc_id,
+                                                    offset=off)
+            else:
+                # shouldn't happen
+                print 'trying to read non-folder type document', parent.type
+                generator = ()
+        for i, node in enumerate(generator):
+            print 'yielding', node.name, node.entry, off + i + 1
+            if node.inode not in self.nodes:
+                self.nodes[node.inode] = node
+            yield (node.name, self.getattr(node.inode), off + i + 1)
+        parent.cached = True
 
     def statfs(self):
         print 'statfs'
@@ -235,7 +294,7 @@ class Lisk(llfuse.Operations):
         if data is None:
             data = ''
         print 'returning read', data
-        return data[offset:offset+length]
+        return data[offset:offset + length]
 
     def write(self, fh, offset, buf):
         #TODO: Assumes that files will be written to sequentially
@@ -248,41 +307,63 @@ class Lisk(llfuse.Operations):
         #lying a bit here...
         return len(buf)
 
+    def mkdir(self, inode_p, name, mode, ctx):
+        print 'mkdir', inode_p, name, mode, ctx
+        parent_node = self.nodes[inode_p]
+        if self.getattr(inode_p).st_nlink == 0:
+            print 'Attempted to create entry %s with unlinked parent %d' % (
+                name, inode_p)
+            raise llfuse.FUSEError(errno.EINVAL)
+
+        if parent_node.type == Node.ROOT:
+            node_type = Node.SPACE
+            # Can't create spaces via api
+            raise llfuse.FUSEError(errno.EINVAL)
+        else:
+            node_type = Node.PROJECT
+            res = utils.post_project({
+                'title': name,
+                'space': parent_node.doc_id
+            })
+        doc_id = res.headers['location'].rsplit('/', 2)[1]
+
+        node = self._make_node(
+            name, parent_node, node_type, doc_id, st_mode=mode,
+            st_ctime=time(), st_mtime=time(), st_atime=time(), st_uid=ctx.uid,
+            st_gid=ctx.gid)
+        self.nodes[node.inode] = node
+
+        return node.entry
+
     def create(self, inode_p, name, mode, flags, ctx):
         parent_node = self.nodes[inode_p]
         if self.getattr(inode_p).st_nlink == 0:
-            log.warn('Attempted to create entry %s with unlinked parent %d',
-                     name, inode_p)
-            raise FUSEError(errno.EINVAL)
+            print 'Attempted to create entry %s with unlinked parent %d' % (
+                name, inode_p)
+            raise llfuse.FUSEError(errno.EINVAL)
 
-        node_type = Node.FILE
-        if mode & stat.S_IFDIR:
-            #directory
-            if parent_node.type == Node.ROOT:
-                node_type = Node.SPACE
-            else:
-                node_type = Node.PROJECT
-            #TODO: create projects/spaces
-            raise FUSEError(errno.EINVAL)
-        else:
-            #file
-            if parent_node.type != Node.PROJECT:
-                #Only allow creating files in projects
-                raise FUSEError(errno.EINVAL)
-            res = utils.post_file({
-                'filename': name,
-                'title': name,
-                'project': parent_node.doc_id,
-            })
-            #yeah...
-            doc_id = res.headers['location'].rsplit('/', 2)[1]
+        if not self.can_create(Node.FILE, parent_node.type):
+            raise llfuse.FUSEError(errno.EINVAL)
+        res = utils.post_file({
+            'filename': name,
+            'title': name,
+            'project': parent_node.doc_id,
+        })
+        #yeah...
+        doc_id = res.headers['location'].rsplit('/', 2)[1]
 
-        node = self._make_node(name, parent_node, node_type, doc_id,
-                          st_mode=mode, st_ctime=time(), st_mtime=time(),
-                          st_atime=time(), st_uid=ctx.uid, st_gid=ctx.gid)
+        node = self._make_node(
+            name, parent_node, Node.FILE, doc_id, st_mode=mode,
+            st_ctime=time(), st_mtime=time(), st_atime=time(), st_uid=ctx.uid,
+            st_gid=ctx.gid)
         self.nodes[node.inode] = node
 
         return (node.inode, node.entry)
+
+    def forget(self, inode_list):
+        print 'entering forget', inode_list
+        for inode, nlookup in inode_list:
+            del self.nodes[inode]
 
 
 class FileWorker(threading.Thread):

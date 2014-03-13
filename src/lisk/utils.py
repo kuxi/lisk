@@ -1,7 +1,5 @@
 import requests
-import base64
 import json
-import threading
 
 import settings
 
@@ -78,8 +76,25 @@ def put_file_content(file_id, content):
     return _request(url, 'put', data=content)
 
 
+def put_file(file_id, file_json):
+    url = '%s/files/%s/' % (settings.BASE_API_URL, file_id)
+    return _request(url, 'put', data=json.dumps(file_json),
+                    headers={'content-type': 'application/json'})
+
+
 def post_file(file_json):
     url = '%s/files/' % (settings.BASE_API_URL)
-    import pdb;pdb.set_trace()
     return _request(url, 'post', data=json.dumps(file_json),
+                    headers={'content-type': 'application/json'})
+
+
+def post_project(project_json):
+    url = '%s/projects/' % (settings.BASE_API_URL)
+    return _request(url, 'post', data=json.dumps(project_json),
+                    headers={'content-type': 'application/json'})
+
+
+def put_project(project_id, project_json):
+    url = '%s/projects/%s/' % (settings.BASE_API_URL, project_id)
+    return _request(url, 'put', data=json.dumps(project_json),
                     headers={'content-type': 'application/json'})
